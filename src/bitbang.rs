@@ -91,25 +91,19 @@ impl <SwClkInputPin, SwClkOutputPin, SwdIoInputPin, SwdIoOutputPin, DelayFn> Bit
         }
     }
     fn set_swclk_output(&mut self, output: bool) {
-        self.swclk_out.as_mut().and_then(|p| {
-            if output {
-                p.set_high().ok()
-            } else {
-                p.set_low().ok()
-            }
-        });
+        match unsafe { self.swclk_out.as_mut().unwrap_unchecked() } { p => {
+            use embedded_hal::digital::v2::PinState::{ Low, High };
+            p.set_state(if output { High } else { Low }).ok()
+        }};
     }
     fn set_swdio_output(&mut self, output: bool) {
-        self.swdio_out.as_mut().and_then(|p| {
-            if output {
-                p.set_high().ok()
-            } else {
-                p.set_low().ok()
-            }
-        });
+        match unsafe { self.swdio_out.as_mut().unwrap_unchecked() } { p => {
+            use embedded_hal::digital::v2::PinState::{ Low, High };
+            p.set_state(if output { High } else { Low }).ok()
+        }};
     }
     fn get_swdio_input(&mut self) -> bool {
-        self.swdio_in.as_mut().and_then(|p| {
+        self.swdio_in.as_ref().and_then(|p| {
             Some(p.is_high().unwrap_or(false))
         }).unwrap()
     }
