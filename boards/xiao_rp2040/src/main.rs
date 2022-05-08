@@ -18,17 +18,27 @@
 #![no_main]
 
 mod line_coding;
-mod swdio_pin;
+// mod swdio_pin;
+mod pio;
 
+use defmt_rtt as _;
+use panic_probe as _;
+
+#[defmt::panic_handler]
+fn panic() -> ! {
+    cortex_m::asm::udf()
+}
 
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true)]
 mod app {
-    use panic_halt as _;
+    // use panic_halt as _;
+    use defmt::println;
 
     use rust_dap::USB_CLASS_MISCELLANEOUS;
     use rust_dap::USB_PROTOCOL_IAD;
     use rust_dap::USB_SUBCLASS_COMMON;
-    use rust_dap::bitbang::*;
+    // use rust_dap::bitbang::*;
+    use crate::pio::*;
 
     use rp_pico::hal;
     use hal::pac;
@@ -44,6 +54,7 @@ mod app {
     use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
     use embedded_hal::serial::{Read, Write};
 
+/*
     type SwdIoPin = hal::gpio::bank0::Gpio4;
     type SwClkPin = hal::gpio::bank0::Gpio2;
     type SwdInputPin<P> = PicoSwdInputPin<P>;
@@ -52,16 +63,21 @@ mod app {
     type SwdIoOutputPin = SwdOutputPin<SwdIoPin>;
     type SwClkInputPin = SwdInputPin<SwClkPin>;
     type SwClkOutputPin = SwdOutputPin<SwClkPin>;
-    type MySwdIoSet = SwdIoSet<SwClkInputPin, SwClkOutputPin, SwdIoInputPin, SwdIoOutputPin, CycleDelay>;
-    
-    pub struct CycleDelay {}
+    pub type MySwdIoSet = SwdIoSet<SwClkInputPin, SwClkOutputPin, SwdIoInputPin, SwdIoOutputPin, CycleDelay>;
+*/    
+
+    type SwClkPin = Pin<hal::gpio::bank0::Gpio2, hal::gpio::FunctionPio0>;
+    type SwdIoPin = Pin<hal::gpio::bank0::Gpio4, hal::gpio::FunctionPio0>;
+    pub type MySwdIoSet = SwdIoSet<SwClkPin, SwdIoPin, CycleDelay>;
+
+    pub struct CycleDelay;
     impl DelayFunc for CycleDelay {
         fn cycle_delay(&self, cycles: u32) {
             cortex_m::asm::delay(cycles);
         }
     }
 
-    use crate::swdio_pin::*;
+    // use crate::swdio_pin::*;
     use crate::line_coding::*;
 
     // UART Interrupt context
@@ -114,6 +130,7 @@ mod app {
         USB_ALLOCATOR: Option<UsbBusAllocator<UsbBus>> = None,
         ])]
     fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
+        println!("Hayon!");
         let mut resets = c.device.RESETS;
         let sio = hal::Sio::new(c.device.SIO);
         let pins = rp_pico::Pins::new(
@@ -168,9 +185,11 @@ mod app {
         let usb_allocator = c.local.USB_ALLOCATOR.as_ref().unwrap();
 
         let swdio = MySwdIoSet::new(
-            PicoSwdInputPin::new(pins.gpio2.into_floating_input()),
-            PicoSwdInputPin::new(pins.gpio4.into_floating_input()),
-            CycleDelay{},
+            c.device.PIO0,
+            pins.gpio2.into_mode::<hal::gpio::FunctionPio0>(),
+            pins.gpio4.into_mode::<hal::gpio::FunctionPio0>(),
+            CycleDelay,
+            &mut resets,
         );
 
         let usb_serial = SerialPort::new(usb_allocator);
