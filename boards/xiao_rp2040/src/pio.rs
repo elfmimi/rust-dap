@@ -34,17 +34,18 @@ pub trait DelayFunc {
 }
 
 pub struct SwdIoSet<C, D, DelayFn>
-    where DelayFn: DelayFunc,
+    // where DelayFn: DelayFunc,
 {
     // We only need these infomation at initialization in fn new() .
     // clk_pin_id: u8,
     // dat_pin_id: u8,
-    cycle_delay: DelayFn,
-    running_sm: Option<hal::pio::StateMachine<hal::pio::PIO0SM0, hal::pio::Running>>,
+    // cycle_delay: DelayFn,
+    _running_sm: Option<hal::pio::StateMachine<hal::pio::PIO0SM0, hal::pio::Running>>,
     rx_fifo: hal::pio::Rx<hal::pio::PIO0SM0>,
     tx_fifo: hal::pio::Tx<hal::pio::PIO0SM0>,
     transfer_count: u32,
     _pins: core::marker::PhantomData<(C,D)>,
+    _cycle_delay: core::marker::PhantomData<DelayFn>,
 }
 
 /*
@@ -70,24 +71,35 @@ impl <C, D, DelayFn> SwdIoSet<pio0::Pin<C>, pio0::Pin<D>, DelayFn>
     where
     C: PinId + bank0::BankPinId,
     D: PinId + bank0::BankPinId,
-    DelayFn: DelayFunc
+    // DelayFn: DelayFunc
 {
-    pub fn new(pio0: pac::PIO0, _: pio0::Pin<C>, _: pio0::Pin<D>, cycle_delay: DelayFn, resets: &mut pac::RESETS) -> Self{
+    pub fn new(pio0: pac::PIO0, _: pio0::Pin<C>, _: pio0::Pin<D>, _cycle_delay: DelayFn, resets: &mut pac::RESETS) -> Self{
+/*
+        // Hints for improving performance.
+        clk_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+        dat_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+        // clk_pin.set_drive_strength(hal::gpio::OutputDriveStrength::TwelveMilliAmps);
+        // dat_pin.set_drive_strength(hal::gpio::OutputDriveStrength::TwelveMilliAmps);
+*/
         let clk_pin_id = C::DYN.num;
         let dat_pin_id = D::DYN.num;
+        // Currently HAL does not provide any way to disable schmitt trigger.
+        // unsafe { core::ptr::write_volatile((0x4001C004 + clk_pin_id as u32 * 4) as *mut u32, 0x71 as u32) };
+        // unsafe { core::ptr::write_volatile((0x4001C004 + dat_pin_id as u32 * 4) as *mut u32, 0x71 as u32); }
 
-        let mut a = pio::Assembler::<{pio::RP2040_MAX_PROGRAM_SIZE}>::new();
-        a.side_set = pio::SideSet::new(true, 1, false);
+        type Assembler = pio::Assembler::<{pio::RP2040_MAX_PROGRAM_SIZE}>;
+        let mut a = Assembler::new_with_side_set(pio::SideSet::new(true, 1, false));
         let mut write_loop = a.label();
         let mut write_loop_enter = a.label();
         let mut read_start = a.label();
         let mut read_loop = a.label();
         let mut read_loop_enter = a.label();
         let mut wrap_target = a.label();
-        // let mut wrap_source = a.label();
+        let mut wrap_source = a.label();
         const HI: u8 = 1;
         const LO: u8 = 0;
-        const Q: u8 = 3 - 1; // delay
+        // As we are using side set in optional mode, maximum delay is 7.
+        const Q: u8 = 4 - 1; // delay
         // Set SWCLK pin as output.
         // a.set(pio::SetDestination::PINDIRS, 1);
         a.bind(&mut wrap_target);
@@ -162,16 +174,16 @@ impl <C, D, DelayFn> SwdIoSet<pio0::Pin<C>, pio0::Pin<D>, DelayFn>
         // a.r#in_with_delay_and_side_set(pio::InSource::PINS, 1, Q, HI);
         // Put result data from ISR to FIFO.
         a.push(false, true);
-        // a.bind(&mut wrap_source);
+        a.bind(&mut wrap_source);
         // Start over.
-        a.jmp(pio::JmpCondition::Always, &mut wrap_target);
+        // a.jmp(pio::JmpCondition::Always, &mut wrap_target);
 
         // The labels wrap_target and wrap_source, as set above,
         // define a loop which is executed repeatedly by the PIO
         // state machine.
-        // let program = a.assemble_with_wrap(wrap_source, wrap_target);
-        let program = a.assemble_program();
-        let program = program.set_origin(Some(0));
+        let program = a.assemble_with_wrap(wrap_source, wrap_target);
+        // let program = a.assemble_program();
+        // let program = program.set_origin(Some(0));
 
         // Initialize and start PIO
         let (mut pio, sm0, _, _, _) = pio0.split(resets);
@@ -194,29 +206,30 @@ impl <C, D, DelayFn> SwdIoSet<pio0::Pin<C>, pio0::Pin<D>, DelayFn>
         Self {
             // clk_pin_id,
             // dat_pin_id,
-            cycle_delay: cycle_delay,
-            running_sm: Some(running_sm),
+            // cycle_delay: cycle_delay,
+            _running_sm: Some(running_sm),
             rx_fifo: rx,
             tx_fifo: tx,
             transfer_count: 0,
             _pins: core::marker::PhantomData,
+            _cycle_delay: core::marker::PhantomData,
         }
     }
 }
 
 impl<C, D, DelayFn> BasicSwdIo for SwdIoSet<C, D, DelayFn>
-    where DelayFn: DelayFunc
+    // where DelayFn: DelayFunc
 {
     // if bits > 32 , it will behave as if value is extended with zeros.
     fn write_bits(&mut self, bits: u32, value: u32) {
         while !self.tx_fifo.write(bits | 1 << 31) { }
         while !self.tx_fifo.write(value) { }
     }
-    // if bits > 32 , result contains only the last 32 bits.
+    // if bits > 32 , result is undefined.
     fn read_bits(&mut self, bits: u32) -> u32 {
         while !self.tx_fifo.write(bits | 0) { }
         while self.rx_fifo.is_empty() { }
-        let value = self.rx_fifo.read().unwrap();
+        let value = unsafe { self.rx_fifo.read().unwrap_unchecked() };
         value >> ((32 - bits) & 31)
     }
     fn to_swdio_in(&mut self) {
@@ -447,7 +460,7 @@ impl<Io: BitBangSwdIo> PrimitiveSwdIo for Io {
 */
 
 impl<C, D, DelayFn> PrimitiveSwdIo for SwdIoSet<C, D, DelayFn>
-    where DelayFn: DelayFunc
+    // where DelayFn: DelayFunc
 {
     fn connect(&mut self) {
         println!("connect!");
@@ -676,7 +689,7 @@ impl<Io: PrimitiveSwdIo> SwdIo for Io {
 
 
 impl<C, D, DelayFn> SwdIo for SwdIoSet<C, D, DelayFn>
-    where DelayFn: DelayFunc
+    // where DelayFn: DelayFunc
 {
     fn connect(&mut self) {
         self.transfer_count = 0;
@@ -703,44 +716,36 @@ impl<C, D, DelayFn> SwdIo for SwdIoSet<C, D, DelayFn>
             bits -= 1;
         }
     }
-    fn swd_read_sequence(&mut self, config: &SwdIoConfig, count: usize, data: &mut [u8]) {
-        let mut count = count;
-        let mut index = 0;
-        while count > 0 {
-            let mut value = 0;
-            let mut bits = 8;
-            while bits > 0 && count > 0 {
-                bits -= 1;
-                count -= 1;
-
-                let bit_value = self.read_bit(config);
-                value = if bit_value {
-                    (value >> 1) | 0x80
-                } else {
-                    value >> 1
-                };
-            }
-            value >>= bits;
-            data[index] = value;
-            index += 1;
-        }
-    }
-    fn swd_write_sequence(&mut self, config: &SwdIoConfig, count: usize, data: &[u8]) {
-        // count > 0 is assured
-        let mut count: u32 = count as u32;
+    fn swd_read_sequence(&mut self, _config: &SwdIoConfig, count: usize, data: &mut [u8]) {
+        let mut count = count as u32;
         let mut index = 0;
         let mut bits = 0;
         let mut value = 0;
-        loop {
+        while count != 0 || bits != 0 {
+            if bits == 0 {
+                bits = if count <= 32 { count } else { 32 };
+                value = self.read_bits(bits);
+                count -= bits;
+            }
+            data[index] = value as u8;
+            index += 1;
+            value >>= 8;
+            bits -= if bits <= 8 { bits } else { 8 };
+        }
+    }
+    fn swd_write_sequence(&mut self, _config: &SwdIoConfig, count: usize, data: &[u8]) {
+        let mut count = count as u32;
+        let mut index = 0;
+        let mut bits = 0;
+        let mut value = 0;
+        while count != 0 {
             value |= (data[index] as u32) << bits;
             index += 1;
             bits += 8;
             if count <= bits {
                 bits = count;
-                self.write_bits(bits, value);
-                break;
             }
-            if bits == 32 {
+            if bits == count || bits == 32 {
                 self.write_bits(bits, value);
                 count -= bits;
                 bits = 0;
@@ -758,52 +763,51 @@ impl<C, D, DelayFn> SwdIo for SwdIoSet<C, D, DelayFn>
             // println!("swd_transfer! {0}", self.transfer_count);
         }
         self.transfer_count += 1;
-        // write request
+        // send request
         // self.enable_output();
         // SwdIo::enable_output(self);
         // PrimitiveSwdIo::enable_output(self);
         {
             let mut bits = request.bits() & 0b1111;
             bits |= (bits.count_ones() as u8 & 1) << 4;
-            bits = (bits << 1) | 0x81;
+            bits = bits << 1 | 0x81;
             self.write_bits(8, bits as u32);
         }
 
-        // turnaround + read ack. ( + turnaround, for write request )
-        // self.disable_output();
-        let ack =
-            if request.contains(SwdRequest::RnW) {
-                self.read_bits(3 + config.turn_around_cycles) as u8 >> config.turn_around_cycles & 0b111
-            } else {
-                self.read_bits(3 + config.turn_around_cycles * 2) as u8 >> config.turn_around_cycles & 0b111
-            };
-        if ack == DAP_TRANSFER_OK {
-            let ack = if request.contains(SwdRequest::RnW) {
-                // READ request
+        let ack;
+        if request.contains(SwdRequest::RnW) {
+            // READ request
+            // turnaround + read ack.
+            ack = self.read_bits(3 + config.turn_around_cycles) as u8 >> config.turn_around_cycles & 0b111;
+            if ack == DAP_TRANSFER_OK {
                 let value = self.read_bits(32);
                 let parity = value.count_ones() & 1;
-                // let parity_expected = self.read_bit(config);
-                // self.turn_around(config);
                 let parity_expected = self.read_bits(1 + config.turn_around_cycles) & 1;
-                // self.enable_output();
-                if parity == parity_expected {
-                    Ok(value)
-                } else {
-                    Err(DapError::SwdError(DAP_TRANSFER_MISMATCH))
-                }
-            } else {
-                // WRITE request
-                // self.turn_around(config);
-                // self.enable_output();
+                let result =
+                    if parity == parity_expected {
+                        Ok(value)
+                    } else {
+                        Err(DapError::SwdError(DAP_TRANSFER_MISMATCH))
+                    };
+                // TODO: capture timestamp
+                self.idle_cycle(config);
+                // self.set_swdio(true);
+                self.to_swdio_out(true);
+                return result;
+            }
+        } else {
+            // WRITE request
+            // turnaround + read ack + turnaround.
+            ack = self.read_bits(3 + config.turn_around_cycles * 2) as u8 >> config.turn_around_cycles & 0b111;
+            if ack == DAP_TRANSFER_OK {
                 self.write_bits(32, data);
                 self.write_bits(1, data.count_ones());
-                Ok(0)
-            };
-            // TODO: capture timestamp
-            self.idle_cycle(config);
-            // self.set_swdio(true);
-            self.to_swdio_out(true);
-            return ack;
+                // TODO: capture timestamp
+                self.idle_cycle(config);
+                // self.set_swdio(true);
+                self.to_swdio_out(true);
+                return Ok(0);
+            }
         }
 
         // An error occured.
@@ -812,21 +816,14 @@ impl<C, D, DelayFn> SwdIo for SwdIoSet<C, D, DelayFn>
             // SwdIo::disable_output(self);
             PrimitiveSwdIo::disable_output(self);
             if config.always_generate_data_phase && request.contains(SwdRequest::RnW) {
-/*
-                for _ in 0..33 {
-                    self.cycle_clock(config);
-                }
-*/
                 self.read_bits(33);
             }
-            self.turn_around(config);
+            if request.contains(SwdRequest::RnW) {
+                self.read_bits(config.turn_around_cycles);
+                // self.turn_around(config);
+            }
             // self.enable_output();
             if config.always_generate_data_phase && !request.contains(SwdRequest::RnW) {
-/*
-                for _ in 0..33 {
-                    self.write_bit(config, false);
-                }
-*/
                 self.write_bits(33, 0);
             }
             // self.set_swdio(true);
@@ -835,15 +832,11 @@ impl<C, D, DelayFn> SwdIo for SwdIoSet<C, D, DelayFn>
         }
 
         // Protocol error
-        // self.turn_around(config);
-/*
-        for _ in 0..33 {
-            self.cycle_clock(config);
-        }
-*/
+        println!("protocol error!");
         self.read_bits(33);
         if request.contains(SwdRequest::RnW) {
-            self.turn_around(config);
+            // self.turn_around(config);
+            self.read_bits(config.turn_around_cycles);
         }
         // self.enable_output();
         // self.set_swdio(true);
