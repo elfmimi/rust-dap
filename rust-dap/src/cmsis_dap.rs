@@ -382,6 +382,32 @@ pub trait CmsisDapCommandInner {
         wait_us: u32,
     ) -> core::result::Result<u8, DapError>;
 
+
+/*
+impl<B, Swd, const MAX_PACKET_SIZE: usize> UsbClass<B> for CmsisDap<'_, B, Swd, MAX_PACKET_SIZE>
+where 
+    B: UsbBus,
+    Swd: SwdIo,
+{
+    fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
+        self.inner.get_configuration_descriptors(writer)
+    }
+    fn get_bos_descriptors(&self, writer: &mut BosWriter) -> Result<()> {
+        self.inner.get_bos_descriptors(writer)
+    }
+    fn get_string(&self, index: StringIndex, lang_id: u16) -> Option<&str> {
+        self.inner.get_string(index, lang_id)
+    }
+    fn reset(&mut self) {
+        self.inner.reset()
+    }
+    fn control_in(&mut self, xfer: ControlIn<B>) {
+        self.inner.control_in(xfer)
+    }
+    fn control_out(&mut self, xfer: ControlOut<B>) {
+        self.inner.control_out(xfer)
+    }
+*/
     fn swj_clock(
         &mut self,
         config: &mut CmsisDapConfig,
@@ -527,6 +553,20 @@ pub trait CmsisDapCommand {
     ) -> core::result::Result<(usize, usize), DapError>;
 }
 
+/*
+fn swd_transfer_config<Swd: SwdIo>(config: &mut CmsisDapConfig, _swdio: &mut Swd, request: &[u8], response: &mut [u8]) -> core::result::Result<(usize, usize), DapError> {
+    if request.len() < 5 {
+        return Err(DapError::InvalidCommand)
+    } else {
+        /* unsafe { idle_cycles = request[0] as u32; } */
+        config.swdio.idle_cycles = request[0] as u32;
+        config.retry_count = u16::from_le_bytes(request[1..3].try_into().unwrap()) as u32;
+        config.match_retry_count = u16::from_le_bytes(request[3..5].try_into().unwrap()) as u32;
+        response[0] = DAP_OK;
+        Ok((5, 1))
+    }
+}
+*/
 impl<Inner: CmsisDapCommandInner> CmsisDapCommand for Inner {
     // 各コマンドの実装を書く
     // JtagやSwdに無い実装はErrを返す
@@ -1214,6 +1254,256 @@ where
                 .map_or(0, |size| size);
         }
         Ok(())
+    }
+
+    pub fn target_reset(&mut self, assert: bool) -> core::result::Result<u32, DapError> {
+        // CORE_0 = 0x01002927
+        // CORE_1 = 0x11002927
+        // RESCUE_DP = 0xf1002927
+
+        let request = &[0x00];
+        let response = &mut [0_u8; 1];
+        self.io.dap_connect(&self.config, request, response)?;
+
+        // dormant_to_swd ( selection_alert + swd_activation_code )
+        let request = &[0x03,
+                        0x38, 0xFF, 0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D,
+                        0x38, 0x85, 0x86, 0xE9, 0xAF, 0xDD, 0xE3, 0xA2,
+                        0x24, 0x0E, 0xBC, 0x19, 0xA0, 0x01];
+        let response = &mut [0_u8; 1];
+        self.io.swd_sequence(&self.config, request, response)?;
+
+        // reset -> targetsel ( RESCUE_DP )
+        let request = &[0x05,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                        0x08, 0x99,
+                        0x85,
+                        0x21, 0x27, 0x29, 0x00, 0xF1, 0x00,
+                        0x02, 0x00];
+        let response = &mut [0_u8; 2];
+        self.io.swd_sequence(&self.config, request, response)?;
+
+        // read DPIDR -> bank_sel -> assert_reset or deassert_reset
+        let request = &[0x00, 0x03,
+                        0x02,
+                        0x08, 0x00, 0x00, 0x00, 0x00,
+                        0x04, 0x00, 0x00, 0x00, if assert { 0x10 } else { 0x00 },
+        ];
+        let response = &mut [0_u8; 6];
+        self.io.transfer(&mut self.config, request, response)?;
+        if assert {
+            return Ok(0);
+        }
+
+        let mut retry = 5;
+        while retry != 0 {
+
+            // line_reset -> dormant_to_swd ( selection_alert + swd_activation_code )
+            let request = &[0x04,
+                            0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                            0x38, 0xFF, 0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D,
+                            0x38, 0x85, 0x86, 0xE9, 0xAF, 0xDD, 0xE3, 0xA2,
+                            0x24, 0x0E, 0xBC, 0x19, 0xA0, 0x01];
+            let response = &mut [0_u8; 1];
+            self.io.swd_sequence(&self.config, request, response)?;
+
+            // line_reset -> targetsel ( CORE_0 )
+            let request = &[0x05,
+                            0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                            0x08, 0x99,
+                            0x85,
+                            0x21, 0x27, 0x29, 0x00, 0x01, 0x00,
+                            0x02, 0x00];
+            let response = &mut [0_u8; 2];
+            self.io.swd_sequence(&self.config, request, response)?;
+
+            // read DPIDR -> bank_sel -> enable_debug -> set_access_size -> set_address -> SYSRESETREQ
+            let request = &[0x00, 0x06,
+                            0x02,
+                            0x08, 0x00, 0x00, 0x00, 0x00,
+                            0x04, 0x00, 0x00, 0x00, 0x50,
+                            0x01, 0x42, 0x00, 0x00, 0x03,
+                            0x05, 0x0C, 0xED, 0x00, 0xE0,
+                            0x0D, 0x04, 0x00, 0xFA, 0x05,
+            ];
+            let response = &mut [0_u8; 6];
+            if let Ok(_) = self.io.transfer(&mut self.config, request, response) {
+                let dpidr = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+                if dpidr != 0 && dpidr.wrapping_add(1) != 0 {
+                    return Ok(0);
+                }
+            }
+            retry -= 1;
+        }
+        Err(DapError::ExceedRetryCount)
+    }
+
+    pub fn read32(&mut self, addr: u32) -> core::result::Result<u32, DapError> {
+            // bank_sel -> set_access_size -> set_address -> read AP DRW
+            let request = &[
+                0x00, 0x04,
+                0x08, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x42, 0x00, 0x00, 0x03,
+                0x05, addr as u8, (addr >> 8) as u8, (addr >> 16) as u8, (addr >> 24) as u8,
+                0x0F,
+            ];
+            let response = &mut [0_u8; 6];
+            if let Ok(_) = self.io.transfer(&mut self.config, request, response) {
+                let word = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+                Ok(word)
+            } else {
+                Err(DapError::InternalError)
+            }
+    }
+
+    pub fn read16(&mut self, addr: u32) -> core::result::Result<u16, DapError> {
+        let word = self.read32(addr & !3)?;
+        if addr & 2 == 0 {
+            Ok(word as u16)
+        } else {
+            Ok((word >> 16) as u16)
+        }
+    }
+
+    pub fn reset_usb_boot(&mut self, assert: bool) -> core::result::Result<u32, DapError> {
+        // CORE_0 = 0x01002927
+        // CORE_1 = 0x11002927
+        // RESCUE_DP = 0xf1002927
+
+        let request = &[0x00];
+        let response = &mut [0_u8; 1];
+        self.io.dap_connect(&self.config, request, response)?;
+
+        // dormant_to_swd ( selection_alert + swd_activation_code )
+        let request = &[0x03,
+                        0x38, 0xFF, 0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D,
+                        0x38, 0x85, 0x86, 0xE9, 0xAF, 0xDD, 0xE3, 0xA2,
+                        0x24, 0x0E, 0xBC, 0x19, 0xA0, 0x01];
+        let response = &mut [0_u8; 1];
+        self.io.swd_sequence(&self.config, request, response)?;
+
+        // reset -> targetsel ( RESCUE_DP )
+        let request = &[0x05,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                        0x08, 0x99,
+                        0x85,
+                        0x21, 0x27, 0x29, 0x00, 0xF1, 0x00,
+                        0x02, 0x00];
+        let response = &mut [0_u8; 2];
+        self.io.swd_sequence(&self.config, request, response)?;
+
+        // read DPIDR -> bank_sel -> assert_reset or deassert_reset
+        let request = &[0x00, 0x03,
+                        0x02,
+                        0x08, 0x00, 0x00, 0x00, 0x00,
+                        0x04, 0x00, 0x00, 0x00, if assert { 0x10 } else { 0x00 },
+        ];
+        let response = &mut [0_u8; 6];
+        self.io.transfer(&mut self.config, request, response)?;
+        if assert {
+            return Ok(0);
+        }
+
+        let mut retry = 5;
+        while retry != 0 {
+
+            // line_reset -> dormant_to_swd ( selection_alert + swd_activation_code )
+            let request = &[0x04,
+                            0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                            0x38, 0xFF, 0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D,
+                            0x38, 0x85, 0x86, 0xE9, 0xAF, 0xDD, 0xE3, 0xA2,
+                            0x24, 0x0E, 0xBC, 0x19, 0xA0, 0x01];
+            let response = &mut [0_u8; 1];
+            self.io.swd_sequence(&self.config, request, response)?;
+
+            // line_reset -> targetsel ( CORE_0 )
+            let request = &[0x05,
+                            0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                            0x08, 0x99,
+                            0x85,
+                            0x21, 0x27, 0x29, 0x00, 0x01, 0x00,
+                            0x02, 0x00];
+            let response = &mut [0_u8; 2];
+            self.io.swd_sequence(&self.config, request, response)?;
+
+            // read DPIDR -> bank_sel -> enable_debug -> set_access_size -> set_address -> enable XOSC
+            let mut ok = Err(DapError::InternalError);
+            let request = &[0x00, 0x06,
+                            0x02,
+                            0x08, 0x00, 0x00, 0x00, 0x00,
+                            0x04, 0x00, 0x00, 0x00, 0x50,
+                            0x01, 0x42, 0x00, 0x00, 0x03,
+                            0x05, 0x00, 0x40, 0x02, 0x40,
+                            0x0D, 0xA0, 0xBA, 0xFA, 0x00,
+            ];
+            let response = &mut [0_u8; 6];
+            if let Ok(_) = self.io.transfer(&mut self.config, request, response) {
+                let dpidr = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+                if dpidr != 0 && dpidr.wrapping_add(1) != 0 {
+                    // return Ok(0);
+                    ok = Ok(0);
+                }
+            }
+            if let Err(_) = ok {
+                retry -= 1;
+                continue;
+            }
+
+            let mut ptr;
+            if let Ok(half) = self.read16(0x14) {
+                ptr = half as u32;
+            } else {
+                retry -= 1;
+                continue;
+            }
+
+            let addr =
+                loop {
+                    match self.read16(ptr) {
+                        Err(_) => break 0,
+                        Ok(0) => break 0,
+                        Ok(code) => {
+                            if code == 0x4255 { // 'UB'
+                                match self.read16(ptr + 2) {
+                                    Err(_) =>
+                                        break 0,
+                                    Ok(addr) => 
+                                        break addr & 0xFFFE,
+                                }
+                            }
+                        }
+                    }
+                    ptr += 4;
+                };
+            if addr == 0 {
+                retry -= 1;
+                continue;
+            }
+
+            let request = &[0x00, 0x0E,
+                            0x05, 0xF0, 0xED, 0x00, 0xE0, // DHCSR
+                            0x0D, 0x03, 0x00, 0x5F, 0xA0, // C_HALT , C_DEBUGEN
+                            0x05, 0xF8, 0xED, 0x00, 0xE0, // DCRDR
+                            0x0D, 0x00, 0x00, 0x00, 0x00, // data = 0
+                            0x05, 0xF4, 0xED, 0x00, 0xE0, // DCRSR
+                            0x0D, 0x00, 0x00, 0x01, 0x00, // write r0
+                            0x05, 0xF4, 0xED, 0x00, 0xE0, // DCRSR
+                            0x0D, 0x01, 0x00, 0x01, 0x00, // write r1
+                            0x05, 0xF8, 0xED, 0x00, 0xE0, // DCRDR
+                            0x0D, (addr as u8), (addr >> 8) as u8, 0x00, 0x00,
+                            0x05, 0xF4, 0xED, 0x00, 0xE0, // DCRSR
+                            0x0D, 0x0F, 0x00, 0x01, 0x00, // write pc (DebugReturnAddress)
+                            0x05, 0xF0, 0xED, 0x00, 0xE0, // DHCSR
+                            0x0D, 0x00, 0x00, 0x5F, 0xA0, // resume
+            ];
+            let response = &mut [0_u8; 2];
+            if let Ok(_) = self.io.transfer(&mut self.config, request, response) {
+                return Ok(0);
+            }
+
+            retry -= 1;
+        }
+        Err(DapError::ExceedRetryCount)
     }
 }
 

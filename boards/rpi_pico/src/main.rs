@@ -106,6 +106,7 @@ mod app {
         uart_rx_consumer: heapless::spsc::Consumer<'static, u8, UART_RX_QUEUE_SIZE>,
         uart_tx_producer: heapless::spsc::Producer<'static, u8, UART_TX_QUEUE_SIZE>,
         uart_tx_consumer: heapless::spsc::Consumer<'static, u8, UART_TX_QUEUE_SIZE>,
+        usb_dap: CmsisDap<'static, UsbBus, SwdIoSet, 64>,
     }
 
     #[local]
@@ -113,7 +114,6 @@ mod app {
         uart_config: UartConfigAndClock,
         uart_rx_producer: heapless::spsc::Producer<'static, u8, UART_RX_QUEUE_SIZE>,
         usb_bus: UsbDevice<'static, UsbBus>,
-        usb_dap: CmsisDap<'static, UsbBus, IoSet, 64>,
         usb_led: Pin<GpioUsbLed, Output<PushPull>>,
         idle_led: Pin<GpioIdleLed, Output<PushPull>>,
         debug_out: Pin<GpioDebugOut, Output<PushPull>>,
@@ -264,12 +264,12 @@ mod app {
                 uart_rx_consumer,
                 uart_tx_producer,
                 uart_tx_consumer,
+                usb_dap,
             },
             Local {
                 uart_config,
                 uart_rx_producer,
                 usb_bus,
-                usb_dap,
                 usb_led,
                 idle_led,
                 debug_out,
@@ -280,8 +280,23 @@ mod app {
         )
     }
 
-    #[idle(shared = [uart_writer, usb_serial, uart_rx_consumer, uart_tx_producer, uart_tx_consumer], local = [idle_led])]
+    #[idle(shared = [uart_writer, usb_serial, uart_rx_consumer, uart_tx_producer, uart_tx_consumer, usb_dap], local = [idle_led])]
     fn idle(mut c: idle::Context) -> ! {
+        #[cfg(feature = "ram-exec")]
+        const DEBOUNCE_TIME: u32 = 20000;
+        #[cfg(feature = "ram-exec")]
+        const DOUBLE_TAP_TIME: u32 = 200000;
+        #[cfg(feature = "ram-exec")]
+        let mut prev_press = false;
+        #[cfg(feature = "ram-exec")]
+        let mut debounce_time = 0;
+        #[cfg(feature = "ram-exec")]
+        let mut double_tap_time = 0;
+        #[cfg(feature = "ram-exec")]
+        let mut double_tap_count = 0;
+        // GPIO_QSPI_SS_CTRL (BOOTSEL pin)
+        #[cfg(feature = "ram-exec")]
+        unsafe { core::ptr::write_volatile(0x4001800C as *mut u32, 0x2000); }
         loop {
             (&mut c.shared.usb_serial, &mut c.shared.uart_tx_producer).lock(
                 |usb_serial, uart_tx_producer| {
@@ -323,6 +338,43 @@ mod app {
             );
 
             c.local.idle_led.toggle().ok();
+
+            #[cfg(feature = "ram-exec")]
+            if debounce_time != 0 {
+                debounce_time -= 1;
+            } else {
+                double_tap_time += 1;
+                // GPIO_QSPI_SS_STATUS (BOOTSEL pin)
+                let press = unsafe { core::ptr::read_volatile(0x40018008 as *mut u32) } & (1 << 17) == 0;
+                if press != prev_press {
+                    if press {
+                        if double_tap_time < DOUBLE_TAP_TIME {
+                            double_tap_count += 1;
+                        } else {
+                            double_tap_count = 1;
+                        }
+                        double_tap_time = 0;
+                    }
+                    prev_press = press;
+                    let assert = press;
+                    // let state = if assert { "Assert Reset" } else { "Deassert Reset" };
+                    c.shared.usb_dap.lock(
+                        |usb_dap|
+                        if let Ok(_value) =
+                            if double_tap_count == 2 {
+                                usb_dap.reset_usb_boot(assert)
+                            } else {
+                                usb_dap.target_reset(assert)
+                            }
+                        {
+                            // println!("{0} OK", state)
+                        } else {
+                            // println!("{0} Error", state);
+                        }
+                    );
+                    debounce_time = DEBOUNCE_TIME;
+                }
+            }
         }
     }
 
@@ -352,22 +404,22 @@ mod app {
     #[task(
         binds = USBCTRL_IRQ,
         priority = 1,
-        shared = [uart_reader, uart_writer, usb_serial, uart_rx_consumer, uart_tx_producer, uart_tx_consumer],
-        local = [usb_bus, usb_dap, uart_config, usb_led, debug_usb_irq_out],
+        shared = [uart_reader, uart_writer, usb_serial, uart_rx_consumer, uart_tx_producer, uart_tx_consumer, usb_dap],
+        local = [usb_bus, uart_config, usb_led, debug_usb_irq_out],
     )]
     fn usbctrl_irq(mut c: usbctrl_irq::Context) {
         c.local.debug_usb_irq_out.set_high().ok();
 
-        let poll_result = c
+        let poll_result = (&mut c
             .shared
-            .usb_serial
-            .lock(|usb_serial| c.local.usb_bus.poll(&mut [usb_serial, c.local.usb_dap]));
+            .usb_serial, &mut c.shared.usb_dap)
+            .lock(|usb_serial, usb_dap| c.local.usb_bus.poll(&mut [usb_serial, usb_dap]));
         if !poll_result {
             c.local.debug_usb_irq_out.set_low().ok();
             return; // Nothing to do at this time...
         }
         // Process DAP commands.
-        c.local.usb_dap.process().ok();
+        c.shared.usb_dap.lock(|usb_dap| usb_dap.process().ok());
 
         // Process TX data.
         (&mut c.shared.usb_serial, &mut c.shared.uart_tx_producer).lock(
