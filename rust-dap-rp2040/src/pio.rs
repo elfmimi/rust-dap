@@ -33,6 +33,7 @@ struct SwdPioContext {
     running_sm: hal::pio::StateMachine<hal::pio::PIO0SM0, hal::pio::Running>,
     rx_fifo: hal::pio::Rx<hal::pio::PIO0SM0>,
     tx_fifo: hal::pio::Tx<hal::pio::PIO0SM0>,
+    swap: bool,
 }
 
 pub struct SwdIoSet<C, D> {
@@ -164,6 +165,7 @@ where
                 running_sm,
                 rx_fifo: rx,
                 tx_fifo: tx,
+                swap: false,
             }),
             _pins: core::marker::PhantomData,
         }
@@ -228,10 +230,11 @@ impl<C, D> SwdIoSet<C, D> {
         let mut context = None;
         core::mem::swap(&mut self.context, &mut context);
         let context = context.unwrap();
+        let swap = !context.swap;
         let (sm0, installed) = context.running_sm.uninit(context.rx_fifo, context.tx_fifo);
         let (sm0, rx_fifo, tx_fifo) = Self::build_pio(
-            self.clk_pin_id,
-            self.dat_pin_id,
+            if swap { self.dat_pin_id } else { self.clk_pin_id },
+            if swap { self.clk_pin_id } else { self.dat_pin_id },
             installed,
             divisor as f32,
             sm0,
@@ -241,6 +244,7 @@ impl<C, D> SwdIoSet<C, D> {
             running_sm,
             rx_fifo,
             tx_fifo,
+            swap,
         });
         core::mem::swap(&mut self.context, &mut new_context);
     }
@@ -249,15 +253,18 @@ impl<C, D> SwdIoSet<C, D> {
 // Connect and disconnect function
 impl<C, D> SwdIoSet<C, D> {
     fn connect(&mut self) {
+        // self.set_clock(DEFAULT_SWJ_CLOCK_HZ);
+        
         self.set_clk_pindir(true);
         self.to_swdio_out(true);
     }
+
     fn disconnect(&mut self) {
         self.to_swdio_in();
         self.set_clk_pindir(false);
         // Reset clock
-        #[cfg(feature = "set_clock")]
-        self.set_clock(DEFAULT_SWJ_CLOCK_HZ);
+        // #[cfg(feature = "set_clock")]
+        // self.set_clock(DEFAULT_SWJ_CLOCK_HZ);
     }
 }
 
@@ -331,7 +338,7 @@ impl<C, D> SwdIo for SwdIoSet<C, D> {
         _config: &mut SwdIoConfig,
         #[allow(unused_variables)] frequency_hz: u32,
     ) -> core::result::Result<(), DapError> {
-        #[cfg(feature = "set_clock")]
+        // #[cfg(feature = "set_clock")]
         self.set_clock(frequency_hz);
         Ok(())
     }
@@ -490,7 +497,127 @@ impl<C, D> CmsisDapCommandInner for SwdIoSet<C, D> {
         config: &mut CmsisDapConfig,
         frequency_hz: u32,
     ) -> core::result::Result<(), DapError> {
-        SwdIo::swj_clock(self, &mut config.swdio, frequency_hz)
+        // SwdIo::swj_clock(self, &mut config.swdio, frequency_hz)
+        // SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
+        self.get_context().swap = false;
+        SwdIo::connect(self);
+        // (self as &mut dyn SwdIo).connect();
+        // self.(SwdIo::connect)();
+// following is an experimental code. it should not be here.
+// { /*
+        // connection detection with swapping SWCLK <-> SWDIO
+
+        // for classic SWD targets
+        let request = &[0x03,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                        0x10, 0x9E, 0xE7,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        let response = &mut [0_u8; 2];
+        CmsisDapCommandInner::swd_sequence(self, &config, request, response).ok();
+
+        let request = &[0x00, 0x01, 0x02];
+        let response = &mut [0_u8; 6];
+        if let Ok(_) = self.transfer(config, request, response) {
+            let dpidr = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+            if dpidr != 0 && dpidr.wrapping_add(1) != 0 {
+                return Ok(());
+            }
+        }
+
+        // for RP2040
+        //
+        // CORE_0 = 0x01002927
+        // CORE_1 = 0x11002927
+        // RESCUE_DP = 0xf1002927
+        //
+        // dormant_to_swd ( selection_alert + swd_activation_code )
+        let request = &[0x03,
+                        0x38, 0xFF, 0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D,
+                        0x38, 0x85, 0x86, 0xE9, 0xAF, 0xDD, 0xE3, 0xA2,
+                        0x24, 0x0E, 0xBC, 0x19, 0xA0, 0x01];
+        let response = &mut [0_u8; 1];
+        CmsisDapCommandInner::swd_sequence(self, &config, request, response).ok();
+
+        // reset -> targetsel ( RESCUE_DP )
+        let request = &[0x05,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                        0x08, 0x99,
+                        0x85,
+                        0x21, 0x27, 0x29, 0x00, 0xF1, 0x00,
+                        0x02, 0x00];
+        let response = &mut [0_u8; 2];
+        CmsisDapCommandInner::swd_sequence(self, &config, request, response).ok();
+
+        // read DPIDR
+        let request = &[0x00, 0x01, 0x02];
+        let response = &mut [0_u8; 6];
+        if let Ok(_) = self.transfer(config, request, response) {
+            let dpidr = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+            if dpidr != 0 && dpidr.wrapping_add(1) != 0 {
+                return Ok(());
+            }
+        }
+
+        // swap SWCLK <-> SWDIO
+        SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
+        SwdIo::connect(self);
+
+        // for classic SWD targets
+        let request = &[0x03,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                        0x10, 0x9E, 0xE7,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        let response = &mut [0_u8; 2];
+        CmsisDapCommandInner::swd_sequence(self, &config, request, response).ok();
+
+        let request = &[0x00, 0x01, 0x02];
+        let response = &mut [0_u8; 6];
+        if let Ok(_) = self.transfer(config, request, response) {
+            let dpidr = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+            if dpidr != 0 && dpidr.wrapping_add(1) != 0 {
+                return Ok(());
+            }
+        }
+
+        // for RP2040
+        //
+        // CORE_0 = 0x01002927
+        // CORE_1 = 0x11002927
+        // RESCUE_DP = 0xf1002927
+        //
+        // dormant_to_swd ( selection_alert + swd_activation_code )
+        let request = &[0x03,
+                        0x38, 0xFF, 0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D,
+                        0x38, 0x85, 0x86, 0xE9, 0xAF, 0xDD, 0xE3, 0xA2,
+                        0x24, 0x0E, 0xBC, 0x19, 0xA0, 0x01];
+        let response = &mut [0_u8; 1];
+        CmsisDapCommandInner::swd_sequence(self, &config, request, response).ok();
+
+        // reset -> targetsel ( RESCUE_DP )
+        let request = &[0x05,
+                        0x38, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+                        0x08, 0x99,
+                        0x85,
+                        0x21, 0x27, 0x29, 0x00, 0xF1, 0x00,
+                        0x02, 0x00];
+        let response = &mut [0_u8; 2];
+        CmsisDapCommandInner::swd_sequence(self, &config, request, response).ok();
+
+        // read DPIDR
+        let request = &[0x00, 0x01, 0x02];
+        let response = &mut [0_u8; 6];
+        if let Ok(_) = self.transfer(config, request, response) {
+            let dpidr = u32::from_le_bytes(response[2..][..4].try_into().unwrap());
+            if dpidr != 0 && dpidr.wrapping_add(1) != 0 {
+                return Ok(());
+            }
+        }
+
+        // Could not detect. Leave pins in default assignment.
+        SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
+        SwdIo::connect(self);
+// */ }
+        Ok(())
     }
 
     fn swd_sequence(
