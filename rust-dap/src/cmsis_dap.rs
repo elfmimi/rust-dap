@@ -115,9 +115,15 @@ pub struct JtagIoConfig {
     pub idle_cycles: u32,
 }
 
-pub trait SwdIo {
+/*
+pub trait ConnectDisconnectSwdIo {
     fn connect(&mut self);
     fn disconnect(&mut self);
+}
+*/
+pub trait SwdIo /* : ConnectDisconnectSwdIo */ {
+    // fn connect(&mut self);
+    // fn disconnect(&mut self);
     fn swj_clock(
         &mut self,
         config: &mut SwdIoConfig,
@@ -298,9 +304,9 @@ impl From<u8> for JtagSequenceInfo {
     }
 }
 
-pub trait CmsisDapCommandInner {
-    fn connect(&mut self, config: &CmsisDapConfig);
-    fn disconnect(&mut self, config: &CmsisDapConfig);
+pub trait CmsisDapCommandInner /* : ConnectDisconnectSwdIo */ {
+    fn connect_with_config(&mut self, config: &CmsisDapConfig);
+    fn disconnect_with_config(&mut self, config: &CmsisDapConfig);
     fn swj_sequence(&mut self, config: &CmsisDapConfig, count: usize, data: &[u8]);
     fn swd_sequence(
         &mut self,
@@ -580,7 +586,7 @@ impl<Inner: CmsisDapCommandInner> CmsisDapCommand for Inner {
             let port = request[0];
             match port {
                 0 | 1 | 2 => {
-                    CmsisDapCommandInner::connect(self, config);
+                    self.connect_with_config(config);
                     response[0] = if port == 0 { 1 } else { port };
                     Ok((1, 1))
                 }
@@ -597,7 +603,7 @@ impl<Inner: CmsisDapCommandInner> CmsisDapCommand for Inner {
         _request: &[u8],
         response: &mut [u8],
     ) -> core::result::Result<(usize, usize), DapError> {
-        CmsisDapCommandInner::disconnect(self, config);
+        self.disconnect_with_config(config);
         response[0] = DAP_OK;
         Ok((0, 1))
     }

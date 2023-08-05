@@ -27,7 +27,7 @@ pub mod pio0 {
 }
 
 const DEFAULT_PIO_DIVISOR: f32 = 1.0f32; // Default PIO Divisor. Generate 125/8 = 15.625[MHz] SWCLK clock.
-const DEFAULT_SWJ_CLOCK_HZ: u32 = ((125000000 / 8) as f32 / DEFAULT_PIO_DIVISOR) as u32;
+// const DEFAULT_SWJ_CLOCK_HZ: u32 = ((125000000 / 8) as f32 / DEFAULT_PIO_DIVISOR) as u32;
 
 struct SwdPioContext {
     running_sm: hal::pio::StateMachine<hal::pio::PIO0SM0, hal::pio::Running>,
@@ -172,25 +172,7 @@ where
     }
 }
 
-// Auxiliary low-level function
 impl<C, D> SwdIoSet<C, D> {
-    fn get_context(&mut self) -> &mut SwdPioContext {
-        self.context.as_mut().unwrap()
-    }
-
-    fn set_clk_pindir(&mut self, oe: bool) {
-        self.get_context().running_sm.exec_instruction(
-            pio::InstructionOperands::SET {
-                destination: pio::SetDestination::PINDIRS,
-                data: match oe {
-                    true => 1,
-                    false => 0,
-                },
-            }
-            .encode(),
-        );
-    }
-
     fn build_pio<P: PIOExt>(
         clk_pin_id: u8,
         dat_pin_id: u8,
@@ -212,6 +194,50 @@ impl<C, D> SwdIoSet<C, D> {
             .clock_divisor(divisor)
             .build(sm0)
     }
+}
+
+// Auxiliary low-level function
+impl<C, D> AuxSwdIo for SwdIoSet<C, D> {
+    fn get_context(&mut self) -> &mut SwdPioContext {
+        self.context.as_mut().unwrap()
+    }
+
+    fn set_clk_pindir(&mut self, oe: bool) {
+        self.get_context().running_sm.exec_instruction(
+            pio::InstructionOperands::SET {
+                destination: pio::SetDestination::PINDIRS,
+                data: match oe {
+                    true => 1,
+                    false => 0,
+                },
+            }
+            .encode(),
+        );
+    }
+
+/*
+    fn build_pio<P: PIOExt>(
+        clk_pin_id: u8,
+        dat_pin_id: u8,
+        installed: hal::pio::InstalledProgram<P>,
+        divisor: f32,
+        sm0: hal::pio::UninitStateMachine<(P, hal::pio::SM0)>,
+    ) -> (
+        hal::pio::StateMachine<(P, hal::pio::SM0), hal::pio::Stopped>,
+        hal::pio::Rx<(P, hal::pio::SM0)>,
+        hal::pio::Tx<(P, hal::pio::SM0)>,
+    ) {
+        hal::pio::PIOBuilder::from_program(installed)
+            .set_pins(clk_pin_id, 1)
+            .side_set_pin_base(clk_pin_id)
+            .out_pins(dat_pin_id, 1)
+            .out_shift_direction(hal::pio::ShiftDirection::Right)
+            .in_pin_base(dat_pin_id)
+            .in_shift_direction(hal::pio::ShiftDirection::Right)
+            .clock_divisor(divisor)
+            .build(sm0)
+    }
+*/
 
     fn set_clock(&mut self, frequency_hz: u32) {
         // Calculate divisor.
@@ -250,8 +276,12 @@ impl<C, D> SwdIoSet<C, D> {
     }
 }
 
+trait ConnectDisconnectSwdIo {
+    fn connect(&mut self);
+    fn disconnect(&mut self);
+}
 // Connect and disconnect function
-impl<C, D> SwdIoSet<C, D> {
+impl<C, D> ConnectDisconnectSwdIo for SwdIoSet<C, D> {
     fn connect(&mut self) {
         // self.set_clock(DEFAULT_SWJ_CLOCK_HZ);
         
@@ -269,7 +299,7 @@ impl<C, D> SwdIoSet<C, D> {
 }
 
 // Basis of SWD interface
-impl<C, D> SwdIoSet<C, D> {
+impl<C, D> BasicSwdIo for SwdIoSet<C, D> {
     // if bits > 32 , it will behave as if value is extended with zeros.
     fn write_bits(&mut self, bits: u32, value: u32) {
         while !self.get_context().tx_fifo.write(bits | 1 << 31) {}
@@ -286,7 +316,14 @@ impl<C, D> SwdIoSet<C, D> {
 }
 
 // Supplemental functions for SWD
-impl<C, D> SwdIoSet<C, D> {
+trait SupplementSwdIo {
+    fn to_swdio_in(&mut self);
+    fn to_swdio_out(&mut self, output: bool);
+    fn idle_cycle(&mut self, config: &SwdIoConfig);
+}
+// impl<C, D> SupplementSwdIo for SwdIoSet<C, D> {
+// impl<T: ?Sized + BasicSwdIo> SupplementSwdIo for T {
+impl<T: BasicSwdIo> SupplementSwdIo for T {
     #[allow(clippy::wrong_self_convention)]
     fn to_swdio_in(&mut self) {
         self.read_bits(0);
@@ -313,26 +350,62 @@ pub trait ConnectDisconnectSwdIo {
     fn connect(&mut self);
     fn disconnect(&mut self);
 }
+*/
 
-pub trait BasicSwdIo {
+trait AuxSwdIo {
+    fn get_context(&mut self) -> &mut SwdPioContext;
+
+    fn set_clk_pindir(&mut self, oe: bool);
+
+/*
+    fn build_pio<P: PIOExt>(
+        clk_pin_id: u8,
+        dat_pin_id: u8,
+        installed: hal::pio::InstalledProgram<P>,
+        divisor: f32,
+        sm0: hal::pio::UninitStateMachine<(P, hal::pio::SM0)>,
+    ) -> (
+        hal::pio::StateMachine<(P, hal::pio::SM0), hal::pio::Stopped>,
+        hal::pio::Rx<(P, hal::pio::SM0)>,
+        hal::pio::Tx<(P, hal::pio::SM0)>,
+    );
+*/
+
+    fn set_clock(&mut self, frequency_hz: u32);
+}
+
+trait BasicSwdIo {
     fn write_bits(&mut self, bits: u32, value: u32);
     fn read_bits(&mut self, bits: u32) -> u32;
 }
 
-pub trait SupplementSwdIo {
-    fn to_swdio_in(&mut self);
-    fn to_swdio_out(&mut self, output: bool);
-    fn idle_cycle(&mut self, config: &SwdIoConfig);
-}
-*/
-
-impl<C, D> SwdIo for SwdIoSet<C, D> {
+trait SuperTrait : AuxSwdIo + BasicSwdIo + ConnectDisconnectSwdIo + SupplementSwdIo { }
+/*
+impl SwdIo for dyn ConnectDisconnectSwdIo {
     fn connect(&mut self) {
         self.connect();
     }
     fn disconnect(&mut self) {
         self.disconnect();
     }
+}
+*/
+
+// impl<C, D> SwdIo for SwdIoSet<C, D> {
+impl SwdIo for dyn SuperTrait {
+/*
+    fn connect(&mut self) {
+        // self.connect();
+        ConnectDisconnectSwdIo::connect(self);
+        // let mut _self: &mut dyn ConnectDisconnectSwdIo = self;
+        // _self.connect();
+    }
+    fn disconnect(&mut self) {
+        // self.disconnect();
+        ConnectDisconnectSwdIo::disconnect(self);
+        // self.(ConnectDisconnectSwdIo::disconnect)();
+    }
+*/
     fn swj_clock(
         &mut self,
         _config: &mut SwdIoConfig,
@@ -480,12 +553,23 @@ impl<C, D> SwdIo for SwdIoSet<C, D> {
     }
 }
 
-impl<C, D> CmsisDapCommandInner for SwdIoSet<C, D> {
-    fn connect(&mut self, _config: &CmsisDapConfig) {
-        SwdIo::connect(self);
+// impl CmsisDapCommandInner for dyn SwdIo {
+impl CmsisDapCommandInner for dyn SuperTrait {
+// impl<T: ?Sized + SuperTrait> CmsisDapCommandInner for T {
+    fn connect_with_config(&mut self, _config: &CmsisDapConfig) {
+        self.connect();
+        // SwdIo::connect(self);
+        // ConnectDisconnectSwdIo::connect(self);
+        // (self as &mut dyn SwdIo).connect();
+        // <dyn SwdIo>::connect(self);
+        // self.<dyn SwdIo>::connect();
     }
-    fn disconnect(&mut self, _config: &CmsisDapConfig) {
-        SwdIo::disconnect(self);
+    fn disconnect_with_config(&mut self, _config: &CmsisDapConfig) {
+        self.disconnect();
+        // (self as &mut dyn SwdIo).disconnect();
+        // SwdIo::disconnect(self);
+        // ConnectDisconnectSwdIo::disconnect(self);
+        // <dyn SwdIo>::disconnect(self);
     }
 
     fn swj_sequence(&mut self, config: &CmsisDapConfig, count: usize, data: &[u8]) {
@@ -497,14 +581,16 @@ impl<C, D> CmsisDapCommandInner for SwdIoSet<C, D> {
         config: &mut CmsisDapConfig,
         frequency_hz: u32,
     ) -> core::result::Result<(), DapError> {
-        // SwdIo::swj_clock(self, &mut config.swdio, frequency_hz)
+        self.get_context().swap = true;
+        SwdIo::swj_clock(self, &mut config.swdio, frequency_hz)?; // this will invert swap
         // SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
-        self.get_context().swap = false;
-        SwdIo::connect(self);
+        // SwdIo::connect(self);
+        self.connect();
+        // <dyn SwdIo>::connect(self);
         // (self as &mut dyn SwdIo).connect();
         // self.(SwdIo::connect)();
 // following is an experimental code. it should not be here.
-// { /*
+{ /*
         // connection detection with swapping SWCLK <-> SWDIO
 
         // for classic SWD targets
@@ -559,7 +645,8 @@ impl<C, D> CmsisDapCommandInner for SwdIoSet<C, D> {
         }
 
         // swap SWCLK <-> SWDIO
-        SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
+        SwdIo::swj_clock(self, &mut config.swdio, frequency_hz);
+        // SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
         SwdIo::connect(self);
 
         // for classic SWD targets
@@ -614,9 +701,10 @@ impl<C, D> CmsisDapCommandInner for SwdIoSet<C, D> {
         }
 
         // Could not detect. Leave pins in default assignment.
-        SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
+        SwdIo::swj_clock(self, &mut config.swdio, frequency_hz);
+        // SwdIo::swj_clock(self, &mut config.swdio, DEFAULT_SWJ_CLOCK_HZ);
         SwdIo::connect(self);
-// */ }
+*/ }
         Ok(())
     }
 

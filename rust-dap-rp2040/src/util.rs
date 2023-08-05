@@ -120,14 +120,14 @@ pub struct UartConfigAndClock {
 type PicoUsbBusAllocator = UsbBusAllocator<UsbBus>;
 
 /// Initialize SWDIO, USB-UART, CMSIS-DAP and USB BUS.
-pub fn initialize_usb<'a, CmsisDapCommandInner, const MAX_PACKET_SIZE: usize>(
+pub fn initialize_usb<'a, CmsisDapCommandInner, const MAX_PACKET_SIZE_2: usize>(
     io: CmsisDapCommandInner,
     usb_allocator: &'a PicoUsbBusAllocator,
     serial: &'a str,
     capabilities: DapCapabilities,
 ) -> (
     SerialPort<'a, UsbBus>,
-    CmsisDap<'a, UsbBus, CmsisDapCommandInner, MAX_PACKET_SIZE>,
+    CmsisDap<'a, UsbBus, CmsisDapCommandInner, MAX_PACKET_SIZE_2>,
     UsbDevice<'a, UsbBus>,
 )
 where

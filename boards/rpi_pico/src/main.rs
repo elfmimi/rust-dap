@@ -202,7 +202,7 @@ mod app {
                 let mut swdio_pin = pins.gpio3.into_mode();
                 swclk_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
                 swdio_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
-                swdio = SwdIoSet::new(c.device.PIO0, swclk_pin, swdio_pin, &mut resets);
+                swdio = IoSet::new(c.device.PIO0, swclk_pin, swdio_pin, &mut resets);
             }
             initialize_usb(
                 swdio,
