@@ -14,8 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use embedded_hal::digital::v2::{InputPin, IoPin, OutputPin, PinState};
-use hal::gpio::{Disabled, Floating, Input, Output, Pin, PinId, PushPull};
+use embedded_hal_0_2::digital::v2::{InputPin, IoPin, OutputPin, PinState};
+// use embedded_hal::digital::{InputPin, OutputPin, PinState, ErrorType};
+use hal::gpio::{Pin, PinId, ValidFunction, FunctionSioInput, FunctionSioOutput, PullUp, PullNone};
+// use hal::gpio::eh1::InOutPin as IoPin;
 use rp2040_hal as hal;
 
 /// InputPin implementation for SWD pin
@@ -23,21 +25,29 @@ pub struct PicoSwdInputPin<I>
 where
     I: PinId,
 {
-    pin: Pin<I, Input<Floating>>,
+    pin: Pin<I, FunctionSioInput, PullNone>,
 }
 
 impl<I> PicoSwdInputPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioInput>,
 {
-    pub fn new(pin: Pin<I, Input<Floating>>) -> Self {
+    pub fn new(pin: Pin<I, FunctionSioInput, PullNone>) -> Self {
         Self { pin }
     }
 }
+/*
+impl<I> ErrorType for PicoSwdInputPin<I>
+where
+    I:  PinId + ValidFunction<FunctionSioInput>,
+{
+    type Error = core::convert::Infallible;
+}
+*/
 
 impl<I> InputPin for PicoSwdInputPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioInput>,
 {
     type Error = core::convert::Infallible;
     fn is_high(&self) -> Result<bool, Self::Error> {
@@ -50,15 +60,20 @@ where
 
 impl<I> IoPin<PicoSwdInputPin<I>, PicoSwdOutputPin<I>> for PicoSwdInputPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioInput> + ValidFunction<FunctionSioOutput>,
 {
     type Error = core::convert::Infallible;
     fn into_input_pin(self) -> Result<PicoSwdInputPin<I>, Self::Error> {
         Ok(self)
     }
     fn into_output_pin(self, state: PinState) -> Result<PicoSwdOutputPin<I>, Self::Error> {
-        let output_pin = self.pin.into_push_pull_output_in_state(state);
-        Ok(PicoSwdOutputPin::new(output_pin))
+        let state = match state {
+            PinState::High => rp2040_hal::gpio::PinState::High,
+            PinState::Low => rp2040_hal::gpio::PinState::Low,
+        };
+        // let output_pin = self.pin.into_push_pull_output_in_state(state);
+        // Ok(PicoSwdOutputPin::new(output_pin))
+        Ok(PicoSwdOutputPin::new(self.pin.into_push_pull_output_in_state(state).into_pull_type()))
     }
 }
 
@@ -67,21 +82,21 @@ pub struct PicoSwdOutputPin<I>
 where
     I: PinId,
 {
-    pin: Pin<I, Output<PushPull>>,
+    pin: Pin<I, FunctionSioOutput, PullNone>,
 }
 
 impl<I> PicoSwdOutputPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioOutput>,
 {
-    pub fn new(pin: Pin<I, Output<PushPull>>) -> Self {
+    pub fn new(pin: Pin<I, FunctionSioOutput, PullNone>) -> Self {
         Self { pin }
     }
 }
 
 impl<I> OutputPin for PicoSwdOutputPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioOutput>,
 {
     type Error = core::convert::Infallible;
     fn set_high(&mut self) -> Result<(), Self::Error> {
@@ -90,19 +105,20 @@ where
     fn set_low(&mut self) -> Result<(), Self::Error> {
         self.pin.set_low()
     }
-    fn set_state(&mut self, state: embedded_hal::digital::v2::PinState) -> Result<(), Self::Error> {
+    fn set_state(&mut self, state: PinState) -> Result<(), Self::Error> {
         self.pin.set_state(state)
     }
 }
 
 impl<I> IoPin<PicoSwdInputPin<I>, PicoSwdOutputPin<I>> for PicoSwdOutputPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioInput> + ValidFunction<FunctionSioOutput>,
 {
     type Error = core::convert::Infallible;
     fn into_input_pin(self) -> Result<PicoSwdInputPin<I>, Self::Error> {
-        let input_pin = self.pin.into_floating_input();
-        Ok(PicoSwdInputPin::new(input_pin))
+        // let input_pin = self.pin.into_floating_input();
+        // Ok(PicoSwdInputPin::new(input_pin))
+        Ok(PicoSwdInputPin::new(self.pin.reconfigure()))
     }
     fn into_output_pin(mut self, state: PinState) -> Result<PicoSwdOutputPin<I>, Self::Error> {
         self.set_state(state)?;
@@ -110,17 +126,18 @@ where
     }
 }
 
+/*
 /// Pico SWD pin
 pub struct PicoSwdPin<I>
 where
     I: PinId,
 {
-    pin: Pin<I, Disabled<Floating>>,
+    pin: Pin<I, hal::gpio::FunctionNull, hal::gpio::PullBusKeep>,
 }
 
 impl<I> IoPin<PicoSwdInputPin<I>, PicoSwdOutputPin<I>> for PicoSwdPin<I>
 where
-    I: PinId,
+    I: PinId + ValidFunction<FunctionSioInput> + ValidFunction<FunctionSioOutput>,
 {
     type Error = core::convert::Infallible;
     fn into_input_pin(self) -> Result<PicoSwdInputPin<I>, Self::Error> {
@@ -128,7 +145,12 @@ where
         Ok(PicoSwdInputPin::new(input_pin))
     }
     fn into_output_pin(self, state: PinState) -> Result<PicoSwdOutputPin<I>, Self::Error> {
+        let state = match state {
+            PinState::High => rp2040_hal::gpio::PinState::High,
+            PinState::Low => rp2040_hal::gpio::PinState::Low,
+        };
         let output_pin = self.pin.into_push_pull_output_in_state(state);
         Ok(PicoSwdOutputPin::new(output_pin))
     }
 }
+*/

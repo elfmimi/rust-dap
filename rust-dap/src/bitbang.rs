@@ -17,7 +17,7 @@
 use crate::cmsis_dap::*;
 use bitflags::bitflags;
 use bitvec::slice::BitSlice;
-use embedded_hal::digital::v2::{InputPin, IoPin, OutputPin, PinState};
+use embedded_hal_0_2::digital::v2::{InputPin, IoPin, OutputPin, PinState};
 
 pub trait DelayFunc {
     fn calculate_half_clock_cycles(_frequency_hz: u32) -> Option<u32> {
