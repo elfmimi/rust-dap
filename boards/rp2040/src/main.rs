@@ -1,0 +1,477 @@
+// Copyright 2021-2022 Kenta Ida
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![no_std]
+#![no_main]
+
+mod bsp;
+
+#[rtic::app(device = rp2040_hal::pac, peripherals = true)]
+mod app {
+
+    #[cfg(not(feature = "defmt"))]
+    use panic_halt as _;
+    #[cfg(feature = "defmt")]
+    use {defmt_rtt as _, panic_probe as _};
+
+    use core::slice;
+    use hal::clocks::Clock;
+    use hal::gpio::{Pin, FunctionSioOutput, FunctionUart, PullDown};
+    use hal::pac;
+    use rp_pico::hal as hal;
+    use crate::bsp as rp_pico;
+
+    use hal::usb::UsbBus;
+    use usb_device::bus::UsbBusAllocator;
+
+    use rust_dap::{CmsisDap, DapCapabilities};
+    use usb_device::prelude::*;
+    use usbd_serial::SerialPort;
+
+    use embedded_hal::digital::{OutputPin, StatefulOutputPin};
+    use embedded_io::{Read, Write};
+
+    use rust_dap_rp2040::line_coding::*;
+    use rust_dap_rp2040::util::{
+        initialize_usb, read_usb_serial_byte_cs, write_usb_serial_byte_cs, UartConfigAndClock,
+    };
+    #[cfg(all(feature = "swd", feature = "bitbang"))]
+    type SwdIoSet = rust_dap_rp2040::util::SwdIoSet<GpioSwClk, GpioSwdIo, GpioReset>;
+    #[cfg(all(feature = "swd", not(feature = "bitbang")))]
+    type SwdIoSet = rust_dap_rp2040::util::SwdIoSet<GpioSwClk, GpioSwdIo, GpioReset>;
+    #[cfg(feature = "jtag")]
+    type JtagIoSet = rust_dap_rp2040::util::JtagIoSet<
+        JtagTckPin,
+        JtagTmsPin,
+        JtagTdiPin,
+        JtagTdoPin,
+        JtagTrstPin,
+        JtagResetPin,
+    >;
+    #[cfg(feature = "swd")]
+    type IoSet = SwdIoSet;
+    #[cfg(feature = "jtag")]
+    type IoSet = JtagIoSet;
+
+    // GPIO mappings
+    type GpioUartTx = hal::gpio::bank0::Gpio0;
+    type GpioUartRx = hal::gpio::bank0::Gpio1;
+    type GpioUsbLed = hal::gpio::bank0::Gpio25;
+    type GpioIdleLed = hal::gpio::bank0::Gpio17;
+    type GpioDebugOut = hal::gpio::bank0::Gpio15;
+    type GpioDebugIrqOut = hal::gpio::bank0::Gpio28;
+    type GpioDebugUsbIrqOut = hal::gpio::bank0::Gpio27;
+    // swd
+    #[cfg(feature = "swd")]
+    type GpioSwClk = hal::gpio::bank0::Gpio2;
+    #[cfg(feature = "swd")]
+    type GpioSwdIo = hal::gpio::bank0::Gpio3;
+    #[cfg(feature = "swd")]
+    type GpioReset = hal::gpio::bank0::Gpio4;
+    // jtag
+    #[cfg(feature = "jtag")]
+    type JtagTckPin = hal::gpio::bank0::Gpio2;
+    #[cfg(feature = "jtag")]
+    type JtagTmsPin = hal::gpio::bank0::Gpio3;
+    #[cfg(feature = "jtag")]
+    type JtagTdoPin = hal::gpio::bank0::Gpio5;
+    #[cfg(feature = "jtag")]
+    type JtagTdiPin = hal::gpio::bank0::Gpio6;
+    #[cfg(feature = "jtag")]
+    type JtagTrstPin = hal::gpio::bank0::Gpio7;
+    #[cfg(feature = "jtag")]
+    type JtagResetPin = hal::gpio::bank0::Gpio4;
+
+    // UART Interrupt context
+    const UART_RX_QUEUE_SIZE: usize = 256;
+    const UART_TX_QUEUE_SIZE: usize = 128;
+    // UART Shared context
+    type UartPins = (
+        Pin<GpioUartTx, FunctionUart, PullDown>,
+        Pin<GpioUartRx, FunctionUart, PullDown>,
+    );
+    type Uart = hal::uart::UartPeripheral<hal::uart::Enabled, pac::UART0, UartPins>;
+    pub struct UartReader(hal::uart::Reader<pac::UART0, UartPins>);
+    pub struct UartWriter(hal::uart::Writer<pac::UART0, UartPins>);
+    unsafe impl Sync for UartReader {}
+    unsafe impl Sync for UartWriter {}
+    unsafe impl Send for UartReader {}
+    unsafe impl Send for UartWriter {}
+
+    #[shared]
+    struct Shared {
+        uart_reader: Option<UartReader>,
+        uart_writer: Option<UartWriter>,
+        usb_serial: SerialPort<'static, UsbBus>,
+        uart_rx_consumer: heapless::spsc::Consumer<'static, u8, UART_RX_QUEUE_SIZE>,
+        uart_tx_producer: heapless::spsc::Producer<'static, u8, UART_TX_QUEUE_SIZE>,
+        uart_tx_consumer: heapless::spsc::Consumer<'static, u8, UART_TX_QUEUE_SIZE>,
+    }
+
+    #[local]
+    struct Local {
+        uart_config: UartConfigAndClock,
+        uart_rx_producer: heapless::spsc::Producer<'static, u8, UART_RX_QUEUE_SIZE>,
+        usb_bus: UsbDevice<'static, UsbBus>,
+        usb_dap: CmsisDap<'static, UsbBus, IoSet, 64>,
+        usb_led: Pin<GpioUsbLed, FunctionSioOutput, PullDown>,
+        idle_led: Pin<GpioIdleLed, FunctionSioOutput, PullDown>,
+        debug_out: Pin<GpioDebugOut, FunctionSioOutput, PullDown>,
+        debug_irq_out: Pin<GpioDebugIrqOut, FunctionSioOutput, PullDown>,
+        debug_usb_irq_out: Pin<GpioDebugUsbIrqOut, FunctionSioOutput, PullDown>,
+    }
+
+    #[init(local = [
+        uart_rx_queue: heapless::spsc::Queue<u8, UART_RX_QUEUE_SIZE> = heapless::spsc::Queue::new(),
+        uart_tx_queue: heapless::spsc::Queue<u8, UART_TX_QUEUE_SIZE> = heapless::spsc::Queue::new(),
+        USB_ALLOCATOR: Option<UsbBusAllocator<UsbBus>> = None,
+        ])]
+    fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
+        let mut resets = c.device.RESETS;
+        let sio = hal::Sio::new(c.device.SIO);
+        let pins = rp_pico::Pins::new(
+            c.device.IO_BANK0,
+            c.device.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut resets,
+        );
+
+        let mut watchdog = hal::Watchdog::new(c.device.WATCHDOG);
+        let clocks = hal::clocks::init_clocks_and_plls(
+            rp_pico::XOSC_CRYSTAL_FREQ,
+            c.device.XOSC,
+            c.device.CLOCKS,
+            c.device.PLL_SYS,
+            c.device.PLL_USB,
+            &mut resets,
+            &mut watchdog,
+        )
+        .ok()
+        .unwrap();
+
+        let uart_pins = (
+            pins.gpio0.reconfigure(), // TxD
+            pins.gpio1.reconfigure(), // RxD
+        );
+        let uart_config = UartConfigAndClock {
+            config: UartConfig::from(hal::uart::UartConfig::default()),
+            clock: clocks.peripheral_clock.freq(),
+        };
+        let mut uart = hal::uart::UartPeripheral::new(c.device.UART0, uart_pins, &mut resets)
+            .enable((&uart_config.config).into(), uart_config.clock)
+            .unwrap();
+        // Enable RX interrupt. Note that TX interrupt is enabled when some TX data is available.
+        uart.enable_rx_interrupt();
+        let (uart_reader, uart_writer) = uart.split();
+        let uart_reader = Some(UartReader(uart_reader));
+        let uart_writer = Some(UartWriter(uart_writer));
+
+        let usb_allocator = UsbBusAllocator::new(hal::usb::UsbBus::new(
+            c.device.USBCTRL_REGS,
+            c.device.USBCTRL_DPRAM,
+            clocks.usb_clock,
+            true,
+            &mut resets,
+        ));
+        c.local.USB_ALLOCATOR.replace(usb_allocator);
+        let usb_allocator = c.local.USB_ALLOCATOR.as_ref().unwrap();
+        #[cfg(feature = "swd")]
+        let (usb_serial, usb_dap, usb_bus) = {
+            // Initialize MCU reset pin.
+            // RESET pin of Cortex Debug 10-pin connector is negative logic
+            // https://developer.arm.com/documentation/101453/0100/CoreSight-Technology/Connectors
+            let reset_pin = pins.gpio4.into_floating_input();
+
+            let swdio;
+            #[cfg(feature = "bitbang")]
+            {
+                use rust_dap_rp2040::{swdio_pin::PicoSwdInputPin, util::CycleDelay};
+                let swclk_pin = PicoSwdInputPin::new(pins.gpio2.into_floating_input());
+                let swdio_pin = PicoSwdInputPin::new(pins.gpio3.into_floating_input());
+                let reset_pin = PicoSwdInputPin::new(reset_pin);
+                swdio = SwdIoSet::new(swclk_pin, swdio_pin, reset_pin, CycleDelay {});
+            }
+            #[cfg(not(feature = "bitbang"))]
+            {
+                let mut swclk_pin = pins.gpio2.reconfigure();
+                let mut swdio_pin = pins.gpio3.reconfigure();
+                let mut reset_pin = reset_pin.reconfigure();
+                swclk_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                swdio_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                reset_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+
+                swdio = SwdIoSet::new(c.device.PIO0, swclk_pin, swdio_pin, reset_pin, &mut resets);
+            }
+            initialize_usb(
+                swdio,
+                usb_allocator,
+                "raspberry-pi-pico-swd",
+                DapCapabilities::SWD,
+            )
+        };
+
+        #[cfg(feature = "jtag")]
+        let (usb_serial, usb_dap, usb_bus) = {
+            let jtagio;
+            #[cfg(feature = "bitbang")]
+            {
+                use rust_dap_rp2040::{swdio_pin::PicoSwdInputPin, util::CycleDelay};
+                let tck_pin = PicoSwdInputPin::new(pins.gpio2.into_floating_input());
+                let tms_pin = PicoSwdInputPin::new(pins.gpio3.into_floating_input());
+                let tdo_pin = PicoSwdInputPin::new(pins.gpio5.into_floating_input());
+                let tdi_pin = PicoSwdInputPin::new(pins.gpio6.into_floating_input());
+                let trst_pin = PicoSwdInputPin::new(pins.gpio7.into_floating_input());
+                let srst_pin = PicoSwdInputPin::new(pins.gpio4.into_floating_input());
+                jtagio = JtagIoSet::new(
+                    tck_pin,
+                    tms_pin,
+                    tdi_pin,
+                    tdo_pin,
+                    trst_pin,
+                    srst_pin,
+                    CycleDelay {},
+                )
+            };
+            #[cfg(not(feature = "bitbang"))]
+            {
+                // PIO
+                let mut tck_pin = pins.gpio2.reconfigure();
+                let mut tms_pin = pins.gpio3.reconfigure();
+                let mut tdo_pin = pins.gpio5.reconfigure();
+                let mut tdi_pin = pins.gpio6.reconfigure();
+                let mut trst_pin = pins.gpio7.reconfigure();
+                let mut srst_pin = pins.gpio4.reconfigure();
+                tck_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                tms_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                tdo_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                tdi_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                trst_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                srst_pin.set_slew_rate(hal::gpio::OutputSlewRate::Fast);
+                jtagio = JtagIoSet::new(
+                    c.device.PIO0,
+                    tck_pin,
+                    tms_pin,
+                    tdi_pin,
+                    tdo_pin,
+                    Some(trst_pin),
+                    Some(srst_pin),
+                    &mut resets,
+                )
+            };
+            initialize_usb(
+                jtagio,
+                usb_allocator,
+                "raspberry-pi-pico-jtag",
+                DapCapabilities::JTAG,
+            )
+        };
+
+        let usb_led = pins.led.into_push_pull_output();
+        let (uart_rx_producer, uart_rx_consumer) = c.local.uart_rx_queue.split();
+        let (uart_tx_producer, uart_tx_consumer) = c.local.uart_tx_queue.split();
+
+        let mut debug_out = pins.gpio15.into_push_pull_output();
+        debug_out.set_low().ok();
+        let mut debug_irq_out = pins.gpio28.into_push_pull_output();
+        debug_irq_out.set_low().ok();
+        let mut debug_usb_irq_out = pins.gpio27.into_push_pull_output();
+        debug_usb_irq_out.set_low().ok();
+
+        pins.gpio16.into_push_pull_output().set_high().ok();
+        let mut idle_led = pins.gpio17.into_push_pull_output();
+        idle_led.set_high().ok();
+        (
+            Shared {
+                uart_reader,
+                uart_writer,
+                usb_serial,
+                uart_rx_consumer,
+                uart_tx_producer,
+                uart_tx_consumer,
+            },
+            Local {
+                uart_config,
+                uart_rx_producer,
+                usb_bus,
+                usb_dap,
+                usb_led,
+                idle_led,
+                debug_out,
+                debug_irq_out,
+                debug_usb_irq_out,
+            },
+            init::Monotonics(),
+        )
+    }
+
+    #[idle(shared = [uart_writer, usb_serial, uart_rx_consumer, uart_tx_producer, uart_tx_consumer], local = [idle_led])]
+    fn idle(mut c: idle::Context) -> ! {
+        loop {
+            (&mut c.shared.usb_serial, &mut c.shared.uart_tx_producer).lock(
+                |usb_serial, uart_tx_producer| {
+                    while uart_tx_producer.ready() {
+                        if let Ok(data) = read_usb_serial_byte_cs(usb_serial) {
+                            uart_tx_producer.enqueue(data).unwrap();
+                        } else {
+                            break;
+                        }
+                    }
+                },
+            );
+            (&mut c.shared.uart_writer, &mut c.shared.uart_tx_consumer).lock(
+                |uart, uart_tx_consumer| {
+                    let uart = uart.as_mut().unwrap();
+                    while let Some(data) = uart_tx_consumer.peek() {
+                        if uart.0.write(slice::from_ref(data)).is_ok() {
+                            uart_tx_consumer.dequeue().unwrap();
+                        } else {
+                            break;
+                        }
+                    }
+                },
+            );
+
+            // Process RX data.
+            (&mut c.shared.usb_serial, &mut c.shared.uart_rx_consumer).lock(
+                |usb_serial, uart_rx_consumer| {
+                    while let Some(data) = uart_rx_consumer.peek() {
+                        match write_usb_serial_byte_cs(usb_serial, *data) {
+                            Ok(_) => {
+                                let _ = uart_rx_consumer.dequeue().unwrap();
+                            }
+                            _ => break,
+                        }
+                    }
+                    usb_serial.flush().ok();
+                },
+            );
+
+            c.local.idle_led.toggle().ok();
+        }
+    }
+
+    #[task(
+        binds = UART0_IRQ,
+        priority = 1,
+        shared = [uart_reader],
+        local = [uart_rx_producer, debug_out, debug_irq_out],
+    )]
+    fn uart_irq(mut c: uart_irq::Context) {
+        c.local.debug_irq_out.set_high().ok();
+        while c.local.uart_rx_producer.ready() {
+            let mut data = Default::default();
+            if let Ok(_) = c
+                .shared
+                .uart_reader
+                .lock(|uart| uart.as_mut().unwrap().0.read(slice::from_mut(&mut data)))
+            {
+                c.local.debug_out.toggle().ok();
+                let _ = c.local.uart_rx_producer.enqueue(data).ok(); // Enqueuing must not fail because we have already checked that the queue is ready to enqueue.
+            } else {
+                break;
+            }
+        }
+        c.local.debug_irq_out.set_low().ok();
+    }
+
+    #[task(
+        binds = USBCTRL_IRQ,
+        priority = 2,   // USBCTRL_IRQ priority must be greater than or equal to UART0_IRQ not to hang up the UART when UART FIFO is full.
+        shared = [uart_reader, uart_writer, usb_serial, uart_rx_consumer, uart_tx_producer, uart_tx_consumer],
+        local = [usb_bus, usb_dap, uart_config, usb_led, debug_usb_irq_out],
+    )]
+    fn usbctrl_irq(mut c: usbctrl_irq::Context) {
+        c.local.debug_usb_irq_out.set_high().ok();
+
+        let poll_result = c
+            .shared
+            .usb_serial
+            .lock(|usb_serial| c.local.usb_bus.poll(&mut [usb_serial, c.local.usb_dap]));
+        if !poll_result {
+            c.local.debug_usb_irq_out.set_low().ok();
+            return; // Nothing to do at this time...
+        }
+        // Process DAP commands.
+        c.local.usb_dap.process().ok();
+
+        // Process TX data.
+        (&mut c.shared.usb_serial, &mut c.shared.uart_tx_producer).lock(
+            |usb_serial, uart_tx_producer| {
+                while uart_tx_producer.ready() {
+                    if let Ok(data) = read_usb_serial_byte_cs(usb_serial) {
+                        uart_tx_producer.enqueue(data).unwrap();
+                    } else {
+                        break;
+                    }
+                }
+            },
+        );
+        (&mut c.shared.uart_writer, &mut c.shared.uart_tx_consumer).lock(
+            |uart, uart_tx_consumer| {
+                let uart = uart.as_mut().unwrap();
+                while let Some(data) = uart_tx_consumer.peek() {
+                    if uart.0.write(slice::from_ref(data)).is_ok() {
+                        uart_tx_consumer.dequeue().unwrap();
+                    } else {
+                        break;
+                    }
+                }
+            },
+        );
+
+        // Process RX data.
+        (&mut c.shared.usb_serial, &mut c.shared.uart_rx_consumer).lock(
+            |usb_serial, uart_rx_consumer| {
+                while let Some(data) = uart_rx_consumer.peek() {
+                    match write_usb_serial_byte_cs(usb_serial, *data) {
+                        Ok(_) => {
+                            let _ = uart_rx_consumer.dequeue().unwrap();
+                        }
+                        _ => break,
+                    }
+                }
+                usb_serial.flush().ok();
+            },
+        );
+
+        // Check if the UART transmitter must be re-configured.
+        if let Ok(expected_config) = c
+            .shared
+            .usb_serial
+            .lock(|usb_serial| UartConfig::try_from(usb_serial.line_coding()))
+        {
+            let config = c.local.uart_config.config;
+            if expected_config != config {
+                (&mut c.shared.uart_reader, &mut c.shared.uart_writer).lock(|reader, writer| {
+                    reader.as_mut().unwrap().0.disable_rx_interrupt();
+                    let disabled =
+                        Uart::join(reader.take().unwrap().0, writer.take().unwrap().0).disable();
+                    let enabled = disabled
+                        .enable((&expected_config).into(), c.local.uart_config.clock)
+                        .unwrap();
+                    c.local.uart_config.config = expected_config;
+                    let (new_reader, new_writer) = enabled.split();
+                    reader.replace(UartReader(new_reader));
+                    writer.replace(UartWriter(new_writer));
+                    reader.as_mut().unwrap().0.enable_rx_interrupt();
+                });
+            }
+        }
+
+        c.local.usb_led.toggle().ok();
+        c.local.debug_usb_irq_out.set_low().ok();
+    }
+}
