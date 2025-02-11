@@ -3,7 +3,19 @@
 
 use rp235x_hal as hal;
 
+// use panic_halt as _;
+#[cfg(not(feature = "defmt"))]
 use panic_halt as _;
+#[cfg(feature = "defmt")]
+use {defmt_rtt as _, panic_probe as _, defmt::println};
+
+#[cfg(not(feature="defmt"))]
+#[macro_use]
+#[allow(unused)]
+mod nullfmt {
+    macro_rules! println { ($($arg:tt)*) => { let _ = ($($arg)*); } }
+}
+
 
 /// Tell the Boot ROM about our application
 #[link_section = ".start_block"]
@@ -176,7 +188,7 @@ fn main() -> ! {
 */
 
 use embedded_hal::digital::StatefulOutputPin;
-use panic_halt as _;
+// use panic_halt as _;
 use rust_dap::bitbang::{DelayFunc, SwdIoSet};
 use rust_dap::{
     CmsisDap, DapCapabilities, USB_CLASS_MISCELLANEOUS, USB_PROTOCOL_IAD, USB_SUBCLASS_COMMON,
@@ -202,6 +214,8 @@ use cortex_m::asm::delay as cycle_delay;
 use cortex_m::peripheral::NVIC;
 #[cfg(target_arch = "arm")]
 use cortex_m_rt::pre_init;
+#[cfg(target_arch = "riscv32")]
+use riscv_rt::pre_init;
 
 
 mod swdio_pin;
@@ -243,7 +257,10 @@ type MySwdIoSet = SwdIoSet<
 struct CycleDelay {}
 impl DelayFunc for CycleDelay {
     fn cycle_delay(&self, cycles: u32) {
+        #[cfg(target_arch = "arm")]
         cortex_m::asm::delay(cycles);
+        #[cfg(target_arch = "riscv32")]
+        riscv::asm::delay(cycles);
     }
 }
 
@@ -356,18 +373,24 @@ fn main() -> ! {
     unsafe {
         // core.NVIC.set_priority(interrupt::USB, 1);
         // NVIC::unmask(interrupt::USB);
-        #[cfg(target_arch = "arm")]
-        NVIC::unmask(hal::pac::Interrupt::USBCTRL_IRQ);
+        // #[cfg(target_arch = "arm")]
+        // NVIC::unmask(hal::pac::Interrupt::USBCTRL_IRQ);
     }
 
+    let mut count = 0;
     loop {
         // unsafe {
         //     USB_DAP.as_mut().map(|dap| {
         //         let _ = dap.process();
         //     });
         // }
-        cycle_delay(15 * 1024 * 1024);
-        led0.toggle().ok();
+        // cycle_delay(15 * 1024 * 1024);
+        poll_usb();
+        count += 1;
+        if count == 1000 {
+            count = 0;
+            led0.toggle().ok();
+        }
     }
 }
 
@@ -407,10 +430,10 @@ fn poll_usb() {
 // fn USB() {
 //     poll_usb();
 // }
-#[interrupt]
-fn USBCTRL_IRQ() {
-    poll_usb();
-}
+// #[interrupt]
+// fn USBCTRL_IRQ() {
+//     poll_usb();
+// }
 
 #[pre_init]
 unsafe fn pre_init() {
